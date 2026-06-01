@@ -204,6 +204,48 @@ fn emit_error(error: &anyhow::Error) -> Result<()> {
     })
 }
 
+fn print_usage() {
+    let program = env::args()
+        .next()
+        .unwrap_or_else(|| "bcast-listener".to_string());
+    eprintln!(
+        "\
+{program} - Redis client-side caching (CLIENT TRACKING BCAST) listener helper
+
+USAGE:
+    {program} [manual] [OPTIONS]
+    {program} --help
+
+MODES:
+    (default)   Stdin/stdout mode. Reads one line-delimited JSON command per
+                line from stdin and writes a JSON response per line to stdout.
+
+                Commands:
+                  {{\"command\":\"setup\",\"redis_url\":\"redis://127.0.0.1:6379/0\",\"listener_count\":100,\"tracking_prefix\":\"bench:\"}}
+                  {{\"command\":\"start_round\",\"round_id\":\"r1\",\"round_prefix\":\"bench:r1:\",\"expected_keys\":100}}
+                  {{\"command\":\"shutdown\"}}
+
+    manual      Spins up the listeners directly from CLI flags, then waits for
+                Ctrl-C before shutting down. Useful for ad-hoc testing.
+
+MANUAL MODE OPTIONS:
+    --redis-url <url>            Redis connection URL (required)
+    --listener-count <n>         Number of tracking clients to create (required)
+    --tracking-prefix <prefix>   Key prefix to track [default: bench:]
+    -h, --help                   Print manual mode usage
+
+GLOBAL OPTIONS:
+    -h, --help                   Print this help and exit
+
+NOTE:
+    The helper currently tracks all keys in BCAST mode, so --tracking-prefix is
+    accepted for CLI compatibility but does not filter invalidations.
+
+EXAMPLE:
+    {program} manual --redis-url redis://127.0.0.1:6379/0 --listener-count 100"
+    );
+}
+
 fn print_manual_usage() {
     // Example:
     // bcast-listener manual --redis-url redis://127.0.0.1:6381/0 --listener-count 100 --tracking-prefix bench:
@@ -308,6 +350,10 @@ async fn run_manual_mode(args: &[String]) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+        print_usage();
+        return Ok(());
+    }
     if matches!(args.first().map(String::as_str), Some("manual")) {
         return run_manual_mode(&args[1..]).await;
     }
