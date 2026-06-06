@@ -106,6 +106,10 @@ impl RuntimeState {
 
             let invalidations_drained = Arc::clone(&self.invalidations_drained);
             client.on_invalidation(move |_invalidation| {
+                // Counts invalidation *messages*, not keys: a single BCAST push can
+                // carry multiple keys (_invalidation.keys). Counter is cumulative for
+                // the process lifetime. See follow-up issue for per-key / per-round
+                // semantics.
                 invalidations_drained.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             });
