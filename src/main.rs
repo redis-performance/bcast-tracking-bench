@@ -104,21 +104,13 @@ impl RuntimeState {
                 .await
                 .context("failed to initialize fred client")?;
 
-            // let invalidations_drained = Arc::clone(&self.invalidations_drained);
+            let invalidations_drained = Arc::clone(&self.invalidations_drained);
             client.on_invalidation(move |_invalidation| {
-                // let _drained = invalidations_drained.fetch_add(1, Ordering::Relaxed) + 1;
-                /*
-                let keys: Vec<String> = _invalidation
-                    .keys
-                    .iter()
-                    .map(|key| key.as_str_lossy().into_owned())
-                    .collect();
-                eprintln!(
-                    // "listener={_listener_index} received BCAST invalidation #{_drained} keys={}",
-                    "listener={_listener_index} received BCAST invalidation keys={}",
-                    keys.join(", ")
-                );
-                */
+                // Counts invalidation *messages*, not keys: a single BCAST push can
+                // carry multiple keys (_invalidation.keys). Counter is cumulative for
+                // the process lifetime. See follow-up issue for per-key / per-round
+                // semantics.
+                invalidations_drained.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             });
 
