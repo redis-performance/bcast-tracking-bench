@@ -1,13 +1,17 @@
-use anyhow::{anyhow, Context, Result};
-use fred::{interfaces::TrackingInterface, prelude::*, types::RespVersion};
+use anyhow::{Context, Result, anyhow};
+use fred::{
+    interfaces::{AclInterface, TrackingInterface},
+    prelude::*,
+    types::RespVersion,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     env,
     io::{self, Write},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 // The stdin/stdout mode accepts one line-delimited JSON command per line.
 // Examples:
 // {"command":"setup","redis_url":"redis://127.0.0.1:6381/0","listener_count":100,"tracking_prefix":"bench:"}
+// {"command":"setup","redis_url":"redis://127.0.0.1:6381/0","listener_count":100,"tracking_prefix":"bench:","acl_user_patterns":["bench:hot:*","bench:cold:*"]}
 // {"command":"start_round","round_id":"r1","round_prefix":"bench:r1:","expected_keys":100}
 // {"command":"shutdown"}
 #[derive(Debug, Deserialize)]
@@ -25,6 +30,14 @@ enum Command {
         redis_url: String,
         listener_count: usize,
         tracking_prefix: String,
+        // Optional: one ACL user is created per entry (each entry may be a
+        // comma-separated list of key glob patterns). Listeners are distributed
+        // round-robin across the created users, each authenticating as its user.
+        // Empty => all listeners use the redis_url credentials (default user).
+        #[serde(default)]
+        acl_user_patterns: Vec<String>,
+        #[serde(default = "default_acl_password")]
+        acl_password: String,
     },
     StartRound {
         round_id: String,
@@ -32,6 +45,10 @@ enum Command {
         expected_keys: usize,
     },
     Shutdown,
+}
+
+fn default_acl_password() -> String {
+    "benchpass".to_string()
 }
 
 #[derive(Default)]
@@ -53,6 +70,12 @@ struct ManualModeConfig {
     redis_url: String,
     listener_count: usize,
     tracking_prefix: String,
+    acl_user_patterns: Vec<String>,
+    acl_password: String,
+}
+
+fn acl_user_name(index: usize) -> String {
+    format!("bcast_user_{index}")
 }
 
 impl RuntimeState {
@@ -62,21 +85,75 @@ impl RuntimeState {
                 redis_url,
                 listener_count,
                 tracking_prefix,
-            } => self.setup(redis_url, listener_count, tracking_prefix).await,
+                acl_user_patterns,
+                acl_password,
+            } => {
+                self.setup(
+                    redis_url,
+                    listener_count,
+                    tracking_prefix,
+                    acl_user_patterns,
+                    acl_password,
+                )
+                .await
+            }
             Command::StartRound {
                 round_id,
                 round_prefix,
                 expected_keys,
-            } => self.start_round(round_id, round_prefix, expected_keys).await,
+            } => {
+                self.start_round(round_id, round_prefix, expected_keys)
+                    .await
+            }
             Command::Shutdown => self.shutdown().await,
         }
+    }
+
+    // Create the ACL users (one per entry in `acl_user_patterns`) on an admin
+    // connection built from `redis_url`. Each user gets `on >password ~<pat...>
+    // +@all` so it may run CLIENT TRACKING but only its key patterns are
+    // ACL-visible -- which is what lets send-time ACL filtering (redis/redis
+    // #15122) drop invalidations for non-permitted keys.
+    async fn create_acl_users(
+        redis_url: &str,
+        acl_user_patterns: &[String],
+        acl_password: &str,
+    ) -> Result<()> {
+        let admin_config = Config::from_url(redis_url)
+            .with_context(|| format!("failed to parse redis url: {redis_url}"))?;
+        let admin = Builder::from_config(admin_config)
+            .build()
+            .context("failed to build admin fred client")?;
+        admin
+            .init()
+            .await
+            .context("failed to initialize admin fred client")?;
+
+        for (index, group) in acl_user_patterns.iter().enumerate() {
+            let username = acl_user_name(index);
+            let mut rules: Vec<String> = vec!["on".to_string(), format!(">{acl_password}")];
+            for pattern in group.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                rules.push(format!("~{pattern}"));
+            }
+            rules.push("+@all".to_string());
+            admin
+                .acl_setuser(username.clone(), rules)
+                .await
+                .with_context(|| format!("failed to ACL SETUSER {username}"))?;
+            println!("Created ACL user {username} with key patterns: {group}");
+        }
+
+        let _ = admin.quit().await;
+        Ok(())
     }
 
     async fn setup(
         &mut self,
         redis_url: String,
         listener_count: usize,
-        _tracking_prefix: String,
+        tracking_prefix: String,
+        acl_user_patterns: Vec<String>,
+        acl_password: String,
     ) -> Result<Response<'static>> {
         if listener_count == 0 {
             return Err(anyhow!("listener_count must be greater than 0"));
@@ -85,13 +162,24 @@ impl RuntimeState {
             return Err(anyhow!("listener helper was already configured"));
         }
 
+        let num_users = acl_user_patterns.len();
+        if num_users > 0 {
+            Self::create_acl_users(&redis_url, &acl_user_patterns, &acl_password).await?;
+        }
+
         let startup_start = current_unix_nanos();
         let mut clients = Vec::with_capacity(listener_count);
 
-        for _listener_index in 0..listener_count {
+        for listener_index in 0..listener_count {
             let mut config = Config::from_url(&redis_url)
                 .with_context(|| format!("failed to parse redis url: {redis_url}"))?;
             config.version = RespVersion::RESP3;
+            if num_users > 0 {
+                // Round-robin each listener onto one of the created ACL users.
+                let username = acl_user_name(listener_index % num_users);
+                config.username = Some(username);
+                config.password = Some(acl_password.clone());
+            }
 
             let client = Builder::from_config(config)
                 .with_performance_config(|config| {
@@ -114,7 +202,7 @@ impl RuntimeState {
                 Ok(())
             });
 
-            let prefixes = vec![_tracking_prefix.clone()];
+            let prefixes = vec![tracking_prefix.clone()];
             println!("Subscribing for the following prefixes: {prefixes:?}");
             client
                 .start_tracking(prefixes, true, false, false, false)
@@ -131,6 +219,7 @@ impl RuntimeState {
             status: "ok",
             payload: json!({
                 "listener_count": listener_count,
+                "acl_user_count": num_users,
                 "startup_duration_ms": self.startup_duration_ms.unwrap_or(0.0),
             }),
         })
@@ -224,27 +313,38 @@ MANUAL MODE OPTIONS:
     --redis-url <url>            Redis connection URL (required)
     --listener-count <n>         Number of tracking clients to create (required)
     --tracking-prefix <prefix>   Key prefix to track [default: bench:]
+    --acl-user-patterns <spec>   Optional. Semicolon-separated list of key-pattern
+                                 groups; one ACL user is created per group (comma =
+                                 multiple patterns per user). Listeners are spread
+                                 round-robin across the users, each authenticating
+                                 as its user, so send-time ACL filtering can drop
+                                 invalidations for non-permitted keys.
+                                 e.g. \"bench:hot:*;bench:cold:*\"
+    --acl-password <pass>        Password for the created ACL users [default: benchpass]
     -h, --help                   Print manual mode usage
 
 GLOBAL OPTIONS:
     -h, --help                   Print this help and exit
 
 NOTE:
-    The helper currently tracks all keys in BCAST mode, so --tracking-prefix is
-    accepted for CLI compatibility but does not filter invalidations.
+    Without --acl-user-patterns all listeners authenticate as the redis_url user
+    (the default user tracks all keys, so nothing is ACL-filtered). To exercise
+    send-time ACL filtering, pass --acl-user-patterns so listeners hold distinct
+    ACL users with restrictive key patterns.
 
 EXAMPLE:
-    {program} manual --redis-url redis://127.0.0.1:6379/0 --listener-count 100"
+    {program} manual --redis-url redis://127.0.0.1:6379/0 --listener-count 100
+    {program} manual --redis-url redis://127.0.0.1:6379/0 --listener-count 200 \\
+        --tracking-prefix bench: --acl-user-patterns \"bench:hot:*;bench:cold:*\""
     );
 }
 
 fn print_manual_usage() {
     // Example:
     // bcast-listener manual --redis-url redis://127.0.0.1:6381/0 --listener-count 100 --tracking-prefix bench:
-    // Note: the helper currently tracks all keys in BCAST mode, so --tracking-prefix
-    // is accepted for CLI compatibility but is not used to filter invalidations.
+    // bcast-listener manual --redis-url redis://127.0.0.1:6381/0 --listener-count 200 --acl-user-patterns "bench:hot:*;bench:cold:*"
     eprintln!(
-        "Usage: bcast-listener manual --redis-url <url> --listener-count <n> [--tracking-prefix <prefix>]"
+        "Usage: bcast-listener manual --redis-url <url> --listener-count <n> [--tracking-prefix <prefix>] [--acl-user-patterns <pat1;pat2;...>] [--acl-password <pass>]"
     );
 }
 
@@ -252,6 +352,8 @@ fn parse_manual_mode_config(args: &[String]) -> Result<ManualModeConfig> {
     let mut redis_url = None;
     let mut listener_count = None;
     let mut tracking_prefix = String::from("bench:");
+    let mut acl_user_patterns: Vec<String> = Vec::new();
+    let mut acl_password = default_acl_password();
     let mut index = 0;
 
     while index < args.len() {
@@ -285,6 +387,25 @@ fn parse_manual_mode_config(args: &[String]) -> Result<ManualModeConfig> {
                     .ok_or_else(|| anyhow!("missing value for --tracking-prefix"))?;
                 tracking_prefix = value.clone();
             }
+            "--acl-user-patterns" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("missing value for --acl-user-patterns"))?;
+                acl_user_patterns = value
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|group| !group.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            "--acl-password" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("missing value for --acl-password"))?;
+                acl_password = value.clone();
+            }
             unknown => {
                 print_manual_usage();
                 return Err(anyhow!("unknown argument: {unknown}"));
@@ -295,9 +416,10 @@ fn parse_manual_mode_config(args: &[String]) -> Result<ManualModeConfig> {
 
     Ok(ManualModeConfig {
         redis_url: redis_url.ok_or_else(|| anyhow!("--redis-url is required"))?,
-        listener_count: listener_count
-            .ok_or_else(|| anyhow!("--listener-count is required"))?,
+        listener_count: listener_count.ok_or_else(|| anyhow!("--listener-count is required"))?,
         tracking_prefix,
+        acl_user_patterns,
+        acl_password,
     })
 }
 
@@ -309,6 +431,8 @@ async fn run_manual_mode(args: &[String]) -> Result<()> {
             config.redis_url,
             config.listener_count,
             config.tracking_prefix.clone(),
+            config.acl_user_patterns.clone(),
+            config.acl_password.clone(),
         )
         .await?;
     emit_response(&Response {
@@ -317,6 +441,7 @@ async fn run_manual_mode(args: &[String]) -> Result<()> {
             "mode": "manual",
             "message": "listeners are ready; press Ctrl-C to stop",
             "tracking_prefix": config.tracking_prefix,
+            "acl_user_count": config.acl_user_patterns.len(),
             "listener_count": setup_response.payload["listener_count"],
             "startup_duration_ms": setup_response.payload["startup_duration_ms"],
         }),
