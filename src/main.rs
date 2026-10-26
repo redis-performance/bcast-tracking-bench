@@ -307,7 +307,7 @@ MODES:
                   {{\"command\":\"shutdown\"}}
 
     manual      Spins up the listeners directly from CLI flags, then waits for
-                Ctrl-C before shutting down. Useful for ad-hoc testing.
+                Ctrl-C or SIGTERM before shutting down. Useful for ad-hoc testing.
 
 MANUAL MODE OPTIONS:
     --redis-url <url>            Redis connection URL (required)
@@ -423,18 +423,48 @@ fn parse_manual_mode_config(args: &[String]) -> Result<ManualModeConfig> {
     })
 }
 
+// Manual mode stops on Ctrl-C (SIGINT) or SIGTERM. SIGTERM is what `docker stop`
+// sends, and in the image this binary is PID 1: the kernel drops a signal sent to
+// PID 1 unless the process handles it, so without this handler the container is
+// SIGKILLed after the stop timeout and the shutdown line is never printed.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("failed while waiting for Ctrl-C"),
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed while waiting for Ctrl-C")
+}
+
 async fn run_manual_mode(args: &[String]) -> Result<()> {
     let config = parse_manual_mode_config(args)?;
     let mut runtime = RuntimeState::default();
-    let setup_response = runtime
-        .setup(
+    // Listen from the start: attaching the listeners can stall under a write
+    // load, and a stop sent meanwhile must not be ignored either.
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    let setup_response = tokio::select! {
+        response = runtime.setup(
             config.redis_url,
             config.listener_count,
             config.tracking_prefix.clone(),
             config.acl_user_patterns.clone(),
             config.acl_password.clone(),
-        )
-        .await?;
+        ) => response?,
+        result = &mut shutdown_signal => {
+            result?;
+            return Err(anyhow!("stopped while the listeners were attaching"));
+        }
+    };
     emit_response(&Response {
         status: "ok",
         payload: json!({
@@ -447,9 +477,7 @@ async fn run_manual_mode(args: &[String]) -> Result<()> {
         }),
     })?;
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("failed while waiting for Ctrl-C")?;
+    shutdown_signal.await?;
 
     let shutdown_response = runtime.shutdown().await?;
     emit_response(&Response {
@@ -505,4 +533,87 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{run_manual_mode, wait_for_shutdown_signal};
+    use std::{
+        process,
+        time::{Duration, Instant},
+    };
+    use tokio::{
+        net::TcpListener,
+        signal::unix::{SignalKind, signal},
+        sync::Mutex,
+        task::JoinHandle,
+    };
+
+    // Signals go to the whole test process: the tests that send them hold this
+    // lock, so a SIGTERM from one test cannot end a wait in another.
+    static SIGNALS: Mutex<()> = Mutex::const_new(());
+
+    // Sends SIG<name> to this process until `task` returns, then returns its output.
+    // The task subscribes when it is first polled, hence the resends.
+    async fn signal_until_done<T>(name: &str, task: JoinHandle<T>) -> T {
+        // Handlers first, so a signal sent before the task subscribes cannot
+        // take the default action and kill the test binary.
+        let _term = signal(SignalKind::terminate()).unwrap();
+        let _int = signal(SignalKind::interrupt()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !task.is_finished() {
+            assert!(Instant::now() < deadline, "SIG{name} did not end the wait");
+            let sent = process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("kill -{name} {}", process::id()))
+                .status()
+                .unwrap();
+            assert!(sent.success(), "kill -{name} failed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let output = task.await.unwrap();
+        // Let a resend still in flight land before another wait subscribes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        output
+    }
+
+    #[tokio::test]
+    async fn wait_ends_on_sigterm_and_on_sigint() {
+        let _signals = SIGNALS.lock().await;
+        for name in ["TERM", "INT"] {
+            signal_until_done(name, tokio::spawn(wait_for_shutdown_signal()))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_mode_stops_on_sigterm_while_listeners_attach() {
+        let _signals = SIGNALS.lock().await;
+        // A server that accepts connections and never answers keeps setup
+        // waiting on the first listener's handshake.
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}/0", server.local_addr().unwrap());
+        let silent_server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = server.accept().await {
+                open.push(socket);
+            }
+        });
+
+        let args = vec![
+            "--redis-url".to_string(),
+            url,
+            "--listener-count".to_string(),
+            "1".to_string(),
+        ];
+        let manual = tokio::spawn(async move { run_manual_mode(&args).await });
+        let error = signal_until_done("TERM", manual).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "stopped while the listeners were attaching"
+        );
+        silent_server.abort();
+    }
 }

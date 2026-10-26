@@ -31,8 +31,9 @@ The tool has two modes.
 
 ### Manual mode
 
-Spins up the listeners directly from CLI flags, then waits for `Ctrl-C` before
-shutting down. Useful for quick, interactive testing.
+Spins up the listeners directly from CLI flags, then waits for `Ctrl-C` or
+`SIGTERM` (what `docker stop` sends) before shutting down. Useful for quick,
+interactive testing.
 
 ```bash
 cargo run --release -- manual \
